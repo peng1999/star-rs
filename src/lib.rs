@@ -107,7 +107,9 @@ impl Spawner {
         let wrapped = async move {
             let result = future.await;
             handle_.result.set(Some(result));
-            handle_.waker.take().map(|waker| waker.wake());
+            if let Some(waker) = handle_.waker.take() {
+                waker.wake();
+            }
         };
         self.state.spawn(wrapped);
         JoinHandle { inner: handle }
@@ -125,6 +127,12 @@ pub struct Runtime {
     // receive id of task to wake
     receiver: Receiver<usize>,
     sender: Sender<usize>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Runtime {
