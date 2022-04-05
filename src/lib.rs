@@ -1,4 +1,7 @@
 pub mod timer;
+mod yield_now;
+
+pub use yield_now::yield_now;
 
 use std::{
     cell::{Cell, RefCell},
@@ -209,9 +212,13 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::Duration,
+    };
 
-    use crate::{Runtime, Spawner};
+    use crate::{yield_now, Runtime, Spawner};
 
     async fn add(a: i32, b: i32) -> i32 {
         a + b
@@ -254,5 +261,33 @@ mod tests {
         let spawner = runtime.spawner();
         let ans = runtime.block_on(fun2(spawner));
         assert_eq!(ans, 42);
+    }
+
+    #[test]
+    fn test_yield() {
+        let runtime = Runtime::new();
+        let spawner = runtime.spawner();
+        let ans = runtime.block_on(async move {
+            let objs = Rc::new(RefCell::new(Vec::new()));
+            let mut handles = vec![];
+            for i in 0..3 {
+                let objs = objs.clone();
+                let h = spawner.spawn(async move {
+                    for _ in 0..2 {
+                        objs.borrow_mut().push(i);
+                        yield_now().await;
+                    }
+                });
+                handles.push(h);
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            objs.take()
+        });
+
+        assert_eq!(ans, vec![0, 1, 2, 0, 1, 2]);
     }
 }
