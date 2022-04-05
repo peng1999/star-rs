@@ -47,6 +47,46 @@ impl SharedState {
             future: Box::pin(future),
         });
     }
+
+    /// check timer that is due
+    fn check_timer(&self) {
+        let mut due_times = self.due_times.borrow_mut();
+        let mut splited = due_times.split_off(&Instant::now());
+        std::mem::swap(&mut splited, &mut due_times);
+        for v in splited.into_values().flatten() {
+            v.wake();
+        }
+    }
+
+    /// sleep until next timmer due
+    fn sleep_until_due(&self) {
+        let due_times = self.due_times.borrow_mut();
+        let due_time = due_times.keys().next().unwrap();
+        std::thread::sleep(due_time.duration_since(Instant::now()));
+    }
+}
+
+struct JoinHandleInner<T> {
+    result: Cell<Option<T>>,
+    waker: Cell<Option<Waker>>,
+}
+
+pub struct JoinHandle<T> {
+    inner: Rc<JoinHandleInner<T>>,
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(res) = this.inner.result.take() {
+            Poll::Ready(res)
+        } else {
+            this.inner.waker.set(Some(cx.waker().clone()));
+            Poll::Pending
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -55,11 +95,22 @@ pub struct Spawner {
 }
 
 impl Spawner {
-    pub fn spawn<F>(&self, future: F)
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
-        F: Future<Output = ()> + 'static,
+        F: Future + 'static,
     {
-        self.state.spawn(future);
+        let handle = Rc::new(JoinHandleInner {
+            result: Cell::new(None),
+            waker: Cell::new(None),
+        });
+        let handle_ = handle.clone();
+        let wrapped = async move {
+            let result = future.await;
+            handle_.result.set(Some(result));
+            handle_.waker.take().map(|waker| waker.wake());
+        };
+        self.state.spawn(wrapped);
+        JoinHandle { inner: handle }
     }
 
     pub fn sleep(&self, duration: Duration) -> timer::TimerFuture {
@@ -105,9 +156,20 @@ impl Runtime {
         Waker::from(Arc::new(waker))
     }
 
-    pub fn run(&self) {
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + 'static,
+    {
+        let spawner = self.spawner();
+        let handle = spawner.spawn(future);
+        self.enter();
+        handle.inner.result.take().unwrap()
+    }
+
+    pub fn enter(&self) {
         loop {
-            match self.state.pending.borrow_mut().pop_front() {
+            let task = self.state.pending.borrow_mut().pop_front();
+            match task {
                 Some(mut task) => {
                     let waker = self.new_waker(task.id);
                     let ctx = &mut Context::from_waker(&waker);
@@ -122,19 +184,12 @@ impl Runtime {
                 }
                 None if self.sleeping.borrow().is_empty() => break,
                 None => {
-                    // sleep until next timmer due
-                    let due_times = self.state.due_times.borrow_mut();
-                    let due_time = due_times.keys().next().unwrap();
-                    std::thread::sleep(due_time.duration_since(Instant::now()));
+                    self.state.sleep_until_due();
                 }
             }
-            // check timer that is due
-            let mut due_times = self.state.due_times.borrow_mut();
-            let mut splited = due_times.split_off(&Instant::now());
-            std::mem::swap(&mut splited, &mut due_times);
-            for v in splited.into_values().flatten() {
-                v.wake();
-            }
+
+            self.state.check_timer();
+
             // check if there is a task to wake
             while let Ok(task_id) = self.receiver.try_recv() {
                 let task = self.sleeping.borrow_mut().remove(&task_id).unwrap();
@@ -146,7 +201,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, time::Duration};
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     use crate::{Runtime, Spawner};
 
@@ -154,35 +209,42 @@ mod tests {
         a + b
     }
 
-    async fn fun(res: Rc<RefCell<i32>>) {
+    async fn fun() -> i32 {
         let a = add(1, 1).await;
         let b = add(a, 1).await;
-        *res.borrow_mut() = b;
+        b
     }
 
     #[test]
     fn simple_compose() {
-        let ans = Rc::new(RefCell::new(0));
         let runtime = Runtime::new();
-        let spawner = runtime.spawner();
-        spawner.spawn(fun(ans.clone()));
-        runtime.run();
-        assert_eq!(*ans.borrow(), 3);
+        let ans = runtime.block_on(fun());
+        assert_eq!(ans, 3);
     }
 
-    async fn fun2(res: Rc<RefCell<i32>>, s: Spawner) {
-        s.sleep(Duration::from_millis(100)).await;
-        *res.borrow_mut() += 21;
+    async fn fun2(s: Spawner) -> i32 {
+        let a = Rc::new(Cell::new(0));
+        let mut handles = vec![];
+        for _ in 0..6 {
+            let a = a.clone();
+            let s_ = s.clone();
+            let h = s.spawn(async move {
+                s_.sleep(Duration::from_millis(100)).await;
+                a.set(a.get() + 7);
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            h.await;
+        }
+        a.get()
     }
 
     #[test]
     fn spawn_sleep() {
-        let ans = Rc::new(RefCell::new(0));
         let runtime = Runtime::new();
         let spawner = runtime.spawner();
-        spawner.spawn(fun2(ans.clone(), spawner.clone()));
-        spawner.spawn(fun2(ans.clone(), spawner.clone()));
-        runtime.run();
-        assert_eq!(*ans.borrow(), 42);
+        let ans = runtime.block_on(fun2(spawner));
+        assert_eq!(ans, 42);
     }
 }
